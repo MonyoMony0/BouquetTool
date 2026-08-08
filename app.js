@@ -289,6 +289,14 @@
     if (!state.session?.is_owner) return renderMain("セッション管理は作成者のみ利用できます。");
     state.view = "management";
     const shareUrl = buildShareUrl(state.session.room_code);
+    const migratable = state.participants.filter((p) => p.id !== state.participant.id);
+    const migrationOptions = state.participants.map((p) =>
+      `<option value="${escapeHtml(p.id)}">${escapeHtml(`${p.display_name}｜ブーケ ${p.balance}｜ID ${p.id.slice(0, 4)}`)}</option>`
+    ).join("");
+    const sourceOptions = migratable.map((p) =>
+      `<option value="${escapeHtml(p.id)}">${escapeHtml(`${p.display_name}｜ブーケ ${p.balance}｜ID ${p.id.slice(0, 4)}`)}</option>`
+    ).join("");
+
     app.innerHTML = shell("Bouquet Tool ｜ セッション管理", `
       ${error ? renderError(error) : ""}
       <div class="panel">
@@ -316,9 +324,26 @@
           <button id="management-history" class="primary-button">履歴を表示</button>
           <button id="management-csv" class="primary-button">CSV出力</button>
         </div>
-        <div class="button-row"><button id="end-session" class="danger-button">セッションを終了</button></div>
-        <div class="button-row"><button id="management-back" class="secondary-button">メイン画面へ戻る</button></div>
       </div>
+      <div class="panel">
+        <h2 class="panel-title">参加者カード移行</h2>
+        <p class="muted small">キャッシュクリア等で同じ参加者のカードが増えた場合に、旧カードの現在ブーケを新カードへ引き継ぎます。過去の履歴は残ります。</p>
+        ${migratable.length ? `
+          <div class="migration-grid">
+            <label class="form-label" for="migration-source">移行元</label>
+            <select id="migration-source" class="input">${sourceOptions}</select>
+            <label class="form-label" for="migration-target">移行先</label>
+            <select id="migration-target" class="input">${migrationOptions}</select>
+          </div>
+          <div class="button-row"><button id="migrate-card" class="secondary-button">カードを移行</button></div>
+        ` : '<div class="empty">移行できる別カードがありません。</div>'}
+      </div>
+      <div class="panel danger-zone">
+        <h2 class="panel-title">セッション終了</h2>
+        <p class="muted small">セッションを終了すると、参加者・ブーケ・履歴を含むセッションデータを削除します。必要な場合は先にCSVを出力してください。</p>
+        <div class="button-row"><button id="end-session" class="danger-button">セッションを終了</button></div>
+      </div>
+      <div class="button-row"><button id="management-back" class="secondary-button">メイン画面へ戻る</button></div>
     `);
 
     bindCopyButtons();
@@ -339,34 +364,55 @@
         renderManagement(readableError(err));
       }
     });
-    document.getElementById("end-session").addEventListener("click", async (e) => {
-      const roomCode = state.session.room_code;
-      const sessionId = state.session.id;
-      const confirmed = confirm(
-        "セッションを終了すると、参加者・ブーケ・履歴がすべて削除され、元に戻せません。\n" +
-        "必要な場合は、先にCSVを出力してください。\n\nセッションを終了しますか？"
+
+    const migrateButton = document.getElementById("migrate-card");
+    if (migrateButton) migrateButton.addEventListener("click", async (e) => {
+      const sourceId = document.getElementById("migration-source").value;
+      const targetId = document.getElementById("migration-target").value;
+      if (sourceId === targetId) return renderManagement("移行元と移行先には別のカードを選択してください。");
+      const source = state.participants.find((p) => p.id === sourceId);
+      const target = state.participants.find((p) => p.id === targetId);
+      if (!source || !target) return renderManagement("移行するカードを確認できませんでした。");
+      const after = Number(source.balance) + Number(target.balance);
+      const ok = confirm(
+        `「${source.display_name}」（ブーケ ${source.balance}）を「${target.display_name}」（ブーケ ${target.balance}）へ移行します。\n` +
+        `移行後のブーケは ${after} になります。移行元カードは画面から消えます。\n` +
+        `この操作は元に戻せません。実行しますか？`
       );
-      if (!confirmed) return;
-
-      setBusyButton(e.currentTarget, true, "削除中…");
-      clearRealtime();
+      if (!ok) return;
+      setBusyButton(e.currentTarget, true, "移行中…");
       try {
-        const { error } = await supabaseClient.rpc("delete_bouquet_session", { p_session_id: sessionId });
+        const { error } = await supabaseClient.rpc("migrate_bouquet_participant", {
+          p_session_id: state.session.id,
+          p_source_participant_id: sourceId,
+          p_target_participant_id: targetId
+        });
         if (error) throw error;
+        await refreshState();
+        showToast("management:migrate", "カードを移行しました", { aggregate: false });
+        renderManagement();
+      } catch (err) {
+        renderManagement(readableError(err));
+      }
+    });
 
+    document.getElementById("end-session").addEventListener("click", async (e) => {
+      if (!confirm("セッションを終了すると、参加者・ブーケ・履歴がすべて削除され、元に戻せません。必要な場合は先にCSVを出力してください。\n\nセッションを終了しますか？")) return;
+      setBusyButton(e.currentTarget, true, "削除中…");
+      const roomCode = state.session.room_code;
+      try {
+        const { error } = await supabaseClient.rpc("delete_bouquet_session", { p_session_id: state.session.id });
+        if (error) throw error;
+        clearRealtime();
         clearParticipantHint(roomCode);
-        setRoomUrl("");
         state.session = null;
         state.participant = null;
         state.participants = [];
         state.history = [];
-        state.amount = 1;
-        state.opQueue = Promise.resolve();
-
+        setRoomUrl("");
+        showToast("management:end", "セッションを終了しました", { aggregate: false });
         renderJoin();
-        showToast("management:end", "セッションを終了し、データを削除しました", { aggregate: false });
       } catch (err) {
-        if (state.session) subscribeRealtime();
         renderManagement(readableError(err));
       }
     });
@@ -518,7 +564,10 @@
         table: "bouquet_participants",
         filter: `session_id=eq.${state.session.id}`
       }, async () => {
-        try { await refreshState(); } catch (err) { console.error(err); }
+        try {
+          await refreshState();
+          if (state.view === "history") { await loadHistory(); renderHistory(); }
+        } catch (err) { console.error(err); }
       })
       .subscribe();
 
@@ -641,6 +690,8 @@
       ["INVALID_TARGET", "投げ先が正しくありません。"],
       ["CANNOT_THROW_TO_SELF", "自分にはブーケを投げられません。"],
       ["INSUFFICIENT_BOUQUET", "ブーケが足りません。"],
+      ["PARTICIPANT_MIGRATED", "この参加者カードは別のカードへ移行済みです。"],
+      ["INVALID_MIGRATION", "カード移行の指定が正しくありません。"],
       ["INVALID_AMOUNT", "ブーケ数は1～999で指定してください。"],
       ["DISPLAY_NAME_REQUIRED", "表示名を入力してください。"],
       ["SESSION_NAME_REQUIRED", "セッション名を入力してください。"]

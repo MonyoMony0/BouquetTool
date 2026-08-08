@@ -1,46 +1,11 @@
--- Bouquet Tool / Supabase schema
--- Run this entire file in Supabase SQL Editor on a new project.
+-- Bouquet Tool / existing database migration
+-- Adds GM-only participant card migration and hard session deletion.
+-- Run this entire file once in Supabase SQL Editor on the existing project.
 
-create extension if not exists pgcrypto;
-
-create table if not exists public.bouquet_sessions (
-  id uuid primary key default gen_random_uuid(),
-  room_code text not null unique,
-  name text not null check (char_length(name) between 1 and 80),
-  owner_user_id uuid not null,
-  status text not null default 'active' check (status in ('active', 'ended')),
-  created_at timestamptz not null default now(),
-  ended_at timestamptz
-);
-
-create table if not exists public.bouquet_participants (
-  id uuid primary key default gen_random_uuid(),
-  session_id uuid not null references public.bouquet_sessions(id) on delete cascade,
-  user_id uuid not null,
-  display_name text not null check (char_length(display_name) between 1 and 40),
-  joined_at timestamptz not null default now(),
-  is_active boolean not null default true,
-  migrated_to_participant_id uuid,
-  migrated_at timestamptz,
-  unique (session_id, user_id)
-);
-
-create table if not exists public.bouquet_events (
-  id uuid primary key default gen_random_uuid(),
-  request_id uuid not null unique,
-  session_id uuid not null references public.bouquet_sessions(id) on delete cascade,
-  actor_participant_id uuid not null references public.bouquet_participants(id) on delete cascade,
-  target_participant_id uuid references public.bouquet_participants(id) on delete cascade,
-  action_type text not null check (action_type in ('throw', 'use')),
-  amount integer not null check (amount between 1 and 999),
-  created_at timestamptz not null default now(),
-  check (
-    (action_type = 'throw' and target_participant_id is not null and target_participant_id <> actor_participant_id)
-    or
-    (action_type = 'use' and target_participant_id = actor_participant_id)
-  )
-);
-
+alter table public.bouquet_participants
+  add column if not exists is_active boolean not null default true,
+  add column if not exists migrated_to_participant_id uuid,
+  add column if not exists migrated_at timestamptz;
 
 create table if not exists public.bouquet_card_migrations (
   id uuid primary key default gen_random_uuid(),
@@ -55,18 +20,19 @@ create table if not exists public.bouquet_card_migrations (
   check (source_participant_id <> target_participant_id)
 );
 
-create index if not exists bouquet_participants_session_idx on public.bouquet_participants(session_id);
-create index if not exists bouquet_events_session_created_idx on public.bouquet_events(session_id, created_at desc);
-create index if not exists bouquet_events_target_idx on public.bouquet_events(target_participant_id);
-create index if not exists bouquet_events_actor_idx on public.bouquet_events(actor_participant_id);
-create index if not exists bouquet_card_migrations_session_created_idx on public.bouquet_card_migrations(session_id, created_at desc);
+create index if not exists bouquet_card_migrations_session_created_idx
+  on public.bouquet_card_migrations(session_id, created_at desc);
 
-alter table public.bouquet_sessions enable row level security;
-alter table public.bouquet_participants enable row level security;
-alter table public.bouquet_events enable row level security;
 alter table public.bouquet_card_migrations enable row level security;
 
--- Helper: current authenticated user participates in this session.
+drop policy if exists "bouquet migrations readable by members" on public.bouquet_card_migrations;
+create policy "bouquet migrations readable by members"
+on public.bouquet_card_migrations for select to authenticated
+using (public.is_bouquet_session_member(session_id));
+
+revoke insert, update, delete on public.bouquet_card_migrations from anon, authenticated;
+grant select on public.bouquet_card_migrations to authenticated;
+
 create or replace function public.is_bouquet_session_member(p_session_id uuid)
 returns boolean
 language sql
@@ -76,98 +42,12 @@ set search_path = public
 as $$
   select exists (
     select 1 from public.bouquet_participants p
-    where p.session_id = p_session_id and p.user_id = auth.uid() and p.is_active
+    where p.session_id = p_session_id
+      and p.user_id = auth.uid()
+      and p.is_active
   );
 $$;
 
-revoke all on function public.is_bouquet_session_member(uuid) from public;
-grant execute on function public.is_bouquet_session_member(uuid) to authenticated;
-
--- RLS: participants can read their session, participants and events.
-drop policy if exists "bouquet sessions readable by members" on public.bouquet_sessions;
-create policy "bouquet sessions readable by members"
-on public.bouquet_sessions for select to authenticated
-using (public.is_bouquet_session_member(id));
-
-drop policy if exists "bouquet participants readable by members" on public.bouquet_participants;
-create policy "bouquet participants readable by members"
-on public.bouquet_participants for select to authenticated
-using (public.is_bouquet_session_member(session_id));
-
-drop policy if exists "bouquet events readable by members" on public.bouquet_events;
-create policy "bouquet events readable by members"
-on public.bouquet_events for select to authenticated
-using (public.is_bouquet_session_member(session_id));
-
-drop policy if exists "bouquet migrations readable by members" on public.bouquet_card_migrations;
-create policy "bouquet migrations readable by members"
-on public.bouquet_card_migrations for select to authenticated
-using (public.is_bouquet_session_member(session_id));
-
--- Do not allow direct browser writes. All writes go through SECURITY DEFINER RPC functions.
-revoke insert, update, delete on public.bouquet_sessions from anon, authenticated;
-revoke insert, update, delete on public.bouquet_participants from anon, authenticated;
-revoke insert, update, delete on public.bouquet_events from anon, authenticated;
-revoke insert, update, delete on public.bouquet_card_migrations from anon, authenticated;
-grant select on public.bouquet_sessions, public.bouquet_participants, public.bouquet_events, public.bouquet_card_migrations to authenticated;
-
--- Generate a short, unambiguous, unique room code.
-create or replace function public.generate_bouquet_room_code()
-returns text
-language plpgsql
-volatile
-security definer
-set search_path = public
-as $$
-declare
-  alphabet constant text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  code text;
-  i integer;
-begin
-  loop
-    code := '';
-    for i in 1..8 loop
-      code := code || substr(alphabet, 1 + floor(random() * length(alphabet))::integer, 1);
-    end loop;
-    exit when not exists (select 1 from public.bouquet_sessions s where s.room_code = code);
-  end loop;
-  return code;
-end;
-$$;
-
--- Create a session and its GM participant.
-create or replace function public.create_bouquet_session(p_name text, p_gm_display_name text)
-returns table(session_id uuid, room_code text, participant_id uuid)
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_user uuid := auth.uid();
-  v_session uuid;
-  v_code text;
-  v_participant uuid;
-begin
-  if v_user is null then raise exception 'AUTH_REQUIRED'; end if;
-  p_name := btrim(p_name);
-  p_gm_display_name := btrim(p_gm_display_name);
-  if p_name = '' or char_length(p_name) > 80 then raise exception 'SESSION_NAME_REQUIRED'; end if;
-  if p_gm_display_name = '' or char_length(p_gm_display_name) > 40 then raise exception 'DISPLAY_NAME_REQUIRED'; end if;
-
-  v_code := public.generate_bouquet_room_code();
-  insert into public.bouquet_sessions(room_code, name, owner_user_id)
-  values (v_code, p_name, v_user)
-  returning id into v_session;
-
-  insert into public.bouquet_participants(session_id, user_id, display_name)
-  values (v_session, v_user, p_gm_display_name)
-  returning id into v_participant;
-
-  return query select v_session, v_code, v_participant;
-end;
-$$;
-
--- Join or resume the same authenticated user in a room.
 create or replace function public.join_bouquet_session(p_room_code text, p_display_name text)
 returns table(session_id uuid, room_code text, participant_id uuid)
 language plpgsql
@@ -213,12 +93,14 @@ set search_path = public
 as $$
   select s.id, s.room_code, p.id
   from public.bouquet_sessions s
-  join public.bouquet_participants p on p.session_id = s.id and p.user_id = auth.uid() and p.is_active
+  join public.bouquet_participants p
+    on p.session_id = s.id
+   and p.user_id = auth.uid()
+   and p.is_active
   where s.room_code = upper(btrim(p_room_code))
   limit 1;
 $$;
 
--- Current balance = received throws - own uses.
 create or replace function public.bouquet_participant_balance(p_participant_id uuid)
 returns bigint
 language sql
@@ -287,16 +169,12 @@ begin
       'is_owner', v_session.owner_user_id = auth.uid(),
       'total_balance', v_total
     ),
-    'me', jsonb_build_object(
-      'id', v_me.id,
-      'display_name', v_me.display_name
-    ),
+    'me', jsonb_build_object('id', v_me.id, 'display_name', v_me.display_name),
     'participants', v_participants
   );
 end;
 $$;
 
--- Serialize actions per actor. This protects use operations across rapid clicks/tabs.
 create or replace function public.perform_bouquet_action(
   p_session_id uuid,
   p_target_participant_id uuid,
@@ -319,7 +197,6 @@ begin
   if p_amount < 1 or p_amount > 999 then raise exception 'INVALID_AMOUNT'; end if;
   if p_action_type not in ('throw','use') then raise exception 'INVALID_ACTION'; end if;
 
-  -- Idempotency: a retried request with the same request_id is harmless.
   if exists (select 1 from public.bouquet_events e where e.request_id = p_request_id) then
     return jsonb_build_object('ok', true, 'duplicate', true);
   end if;
@@ -332,7 +209,6 @@ begin
   where p.session_id = p_session_id and p.user_id = auth.uid() and p.is_active;
   if not found then raise exception 'NOT_SESSION_MEMBER'; end if;
 
-  -- Serialize all actions by this actor (works across tabs/devices for this auth user).
   perform pg_advisory_xact_lock(hashtextextended(v_actor.id::text, 0));
 
   select * into v_target from public.bouquet_participants p
@@ -385,37 +261,6 @@ begin
 end;
 $$;
 
-create or replace function public.rename_bouquet_session(p_session_id uuid, p_name text)
-returns void
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  p_name := btrim(p_name);
-  if p_name = '' or char_length(p_name) > 80 then raise exception 'SESSION_NAME_REQUIRED'; end if;
-  update public.bouquet_sessions s
-  set name = p_name
-  where s.id = p_session_id and s.owner_user_id = auth.uid();
-  if not found then raise exception 'NOT_SESSION_OWNER'; end if;
-end;
-$$;
-
-create or replace function public.end_bouquet_session(p_session_id uuid)
-returns void
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  update public.bouquet_sessions s
-  set status = 'ended', ended_at = coalesce(ended_at, now())
-  where s.id = p_session_id and s.owner_user_id = auth.uid();
-  if not found then raise exception 'NOT_SESSION_OWNER'; end if;
-end;
-$$;
-
-
 create or replace function public.migrate_bouquet_participant(
   p_session_id uuid,
   p_source_participant_id uuid,
@@ -444,7 +289,6 @@ begin
   select * into v_actor from public.bouquet_participants p
   where p.session_id = p_session_id and p.user_id = auth.uid() and p.is_active;
   if not found then raise exception 'NOT_SESSION_MEMBER'; end if;
-
   if v_actor.id = p_source_participant_id then raise exception 'CANNOT_MIGRATE_CURRENT_GM'; end if;
 
   perform pg_advisory_xact_lock(hashtextextended(p_session_id::text, 0));
@@ -493,36 +337,12 @@ begin
 end;
 $$;
 
--- RPC permissions
-revoke all on function public.generate_bouquet_room_code() from public;
-revoke all on function public.create_bouquet_session(text,text) from public;
-revoke all on function public.join_bouquet_session(text,text) from public;
-revoke all on function public.resume_bouquet_session(text) from public;
-revoke all on function public.bouquet_participant_balance(uuid) from public;
-revoke all on function public.get_bouquet_session_state(text) from public;
-revoke all on function public.perform_bouquet_action(uuid,uuid,text,integer,uuid) from public;
-revoke all on function public.get_bouquet_history(uuid,integer) from public;
-revoke all on function public.rename_bouquet_session(uuid,text) from public;
-revoke all on function public.end_bouquet_session(uuid) from public;
 revoke all on function public.migrate_bouquet_participant(uuid,uuid,uuid) from public;
 revoke all on function public.delete_bouquet_session(uuid) from public;
-
-grant execute on function public.create_bouquet_session(text,text) to authenticated;
-grant execute on function public.join_bouquet_session(text,text) to authenticated;
-grant execute on function public.resume_bouquet_session(text) to authenticated;
-grant execute on function public.get_bouquet_session_state(text) to authenticated;
-grant execute on function public.perform_bouquet_action(uuid,uuid,text,integer,uuid) to authenticated;
-grant execute on function public.get_bouquet_history(uuid,integer) to authenticated;
-grant execute on function public.rename_bouquet_session(uuid,text) to authenticated;
-grant execute on function public.end_bouquet_session(uuid) to authenticated;
 grant execute on function public.migrate_bouquet_participant(uuid,uuid,uuid) to authenticated;
 grant execute on function public.delete_bouquet_session(uuid) to authenticated;
 
--- Realtime publication. Safe to re-run.
 do $$
 begin
-  begin alter publication supabase_realtime add table public.bouquet_sessions; exception when duplicate_object then null; end;
-  begin alter publication supabase_realtime add table public.bouquet_participants; exception when duplicate_object then null; end;
-  begin alter publication supabase_realtime add table public.bouquet_events; exception when duplicate_object then null; end;
   begin alter publication supabase_realtime add table public.bouquet_card_migrations; exception when duplicate_object then null; end;
 end $$;
