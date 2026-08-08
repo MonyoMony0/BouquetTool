@@ -165,7 +165,7 @@ begin
 
   insert into public.bouquet_participants(session_id, user_id, display_name)
   values (v_session.id, v_user, p_display_name)
-  on conflict (session_id, user_id)
+  on conflict on constraint bouquet_participants_session_id_user_id_key
   do update set display_name = excluded.display_name
   returning id into v_participant;
 
@@ -350,21 +350,17 @@ begin
 end;
 $$;
 
-create or replace function public.delete_bouquet_session(p_session_id uuid)
+create or replace function public.end_bouquet_session(p_session_id uuid)
 returns void
 language plpgsql
 security definer
 set search_path = public
 as $$
-declare
-  v_deleted uuid;
 begin
-  delete from public.bouquet_sessions s
-  where s.id = p_session_id and s.owner_user_id = auth.uid()
-  returning s.id into v_deleted;
-
-  if v_deleted is null then raise exception 'NOT_SESSION_OWNER'; end if;
-  -- bouquet_participants / bouquet_events are removed automatically by ON DELETE CASCADE.
+  update public.bouquet_sessions s
+  set status = 'ended', ended_at = coalesce(ended_at, now())
+  where s.id = p_session_id and s.owner_user_id = auth.uid();
+  if not found then raise exception 'NOT_SESSION_OWNER'; end if;
 end;
 $$;
 
@@ -378,7 +374,7 @@ revoke all on function public.get_bouquet_session_state(text) from public;
 revoke all on function public.perform_bouquet_action(uuid,uuid,text,integer,uuid) from public;
 revoke all on function public.get_bouquet_history(uuid,integer) from public;
 revoke all on function public.rename_bouquet_session(uuid,text) from public;
-revoke all on function public.delete_bouquet_session(uuid) from public;
+revoke all on function public.end_bouquet_session(uuid) from public;
 
 grant execute on function public.create_bouquet_session(text,text) to authenticated;
 grant execute on function public.join_bouquet_session(text,text) to authenticated;
@@ -387,7 +383,7 @@ grant execute on function public.get_bouquet_session_state(text) to authenticate
 grant execute on function public.perform_bouquet_action(uuid,uuid,text,integer,uuid) to authenticated;
 grant execute on function public.get_bouquet_history(uuid,integer) to authenticated;
 grant execute on function public.rename_bouquet_session(uuid,text) to authenticated;
-grant execute on function public.delete_bouquet_session(uuid) to authenticated;
+grant execute on function public.end_bouquet_session(uuid) to authenticated;
 
 -- Realtime publication. Safe to re-run.
 do $$
